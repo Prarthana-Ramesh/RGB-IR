@@ -1,0 +1,87 @@
+# Training configuration for RGB to IR translation model
+
+training:
+  # Directory configuration
+  output_dir: "./experiments/rgb2ir_v1"
+  
+  # Training hyperparameters
+  batch_size: 4
+  num_workers: 4
+  epochs: 100
+  
+  # Learning rate schedule
+  learning_rate: 5e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  lr_scheduler: "cosine"  # Options: cosine, constant, step
+  
+  # Training settings
+  log_interval: 100        # Log metrics every N steps
+  save_interval: 5         # Save checkpoint every N epochs
+  val_interval: 2          # Validate every N epochs
+  
+  # Loss weights
+  loss_weights:
+    l1: 1.0
+    hadar: 0.5             # Thermal dynamics from PID project
+    emissivity: 0.1        # Material properties (to_k)
+    transmitivity: 0.05    # Atmospheric effects
+    perceptual: 0.1        # Feature similarity
+    structure: 0.2         # Attention consistency (structure preservation)
+  
+  # Gradient handling
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+
+
+# Model configuration
+model:
+  config_path: "./configs/rgb2ir_loha.yaml"
+  enable_controlnet: true
+  
+  # Pretrained model
+  pretrained: "stabilityai/stable-diffusion-xl-1-0"
+  load_weights: null  # Optional checkpoint to resume training
+
+
+# Data configuration
+data:
+  dataset_root: "./data/RGB2IR_dataset"  # Path to your aligned RGB-IR dataset
+  image_size: [512, 512]  # Input image size
+  
+  # Data augmentation
+  augmentation:
+    enable: true
+    horizontal_flip: 0.5
+    brightness_contrast: 0.2
+    gaussian_noise: 0.1
+  
+  # Normalization
+  rgb_normalize: true  # Normalize to [-1, 1]
+  ir_normalize: true   # Normalize with thermal parameters
+
+
+# Inference configuration
+inference:
+  # Generation settings
+  guidance_scale: 7.5
+  num_inference_steps: 50
+  strength: 0.8
+  
+  # ControlNet guidance
+  controlnet:
+    depth:
+      scale: 1.0
+    canny:
+      scale: 0.7
+
+
+# Logging configuration
+logging:
+  level: "INFO"
+  use_tensorboard: true
+  tensorboard_dir: "./experiments/rgb2ir_v1/logs"
+
+
+# Debugging
+debug: false

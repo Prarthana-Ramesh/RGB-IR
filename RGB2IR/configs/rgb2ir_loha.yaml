@@ -1,0 +1,153 @@
+# LoHA Configuration for RGB-to-IR Translation
+# Uses Low-rank Hadamard Product for parameter-efficient fine-tuning
+
+# SDXL Text Encoder LoHA Configuration
+text_encoder:
+  r: 16                    # Higher rank for semantic understanding
+  alpha: 32
+  rank_dropout: 0.1
+  module_dropout: 0.0
+  init_weights: true
+  use_effective_conv2d: false
+  
+  # Target modules in text encoder
+  target_modules:
+    - "k_proj"              # Key projection for attention
+    - "q_proj"              # Query projection
+    - "v_proj"              # Value projection
+    - "out_proj"            # Output projection
+    - "fc1"                 # Feed-forward layer 1
+    - "fc2"                 # Feed-forward layer 2
+  
+  # Specialized target modules for material recognition
+  # These will learn material properties from RGB
+  special_targets:
+    material_recognition:   # Material-aware projections
+      - "layer.12.self_attn.k_proj"  # Mid-level layers for material
+      - "layer.11.self_attn.k_proj"
+
+# SDXL UNet LoHA Configuration
+unet:
+  r: 8                      # Base rank for efficiency
+  alpha: 16
+  rank_dropout: 0.05
+  module_dropout: 0.0
+  init_weights: true
+  use_effective_conv2d: true  # Efficient Conv2d decomposition
+  
+  # Target modules in UNet
+  target_modules:
+    # Attention projections (for structure preservation)
+    - "to_k"                # Key projection - MATERIAL RECOGNITION
+    - "to_q"                # Query projection
+    - "to_v"                # Value projection - EMISSIVITY/TRANSMITIVITY
+    - "to_out.0"            # Output projection
+    
+    # Feed-forward networks (for thermal properties)
+    - "ff.net.0.proj"       # FF projection 1
+    - "ff.net.2"            # FF projection 2
+    
+    # Cross-attention (for prompt conditioning)
+    - "processor.to_q"
+    - "processor.to_k"
+    - "processor.to_v"
+  
+  # Layer-specific configurations
+  layer_configs:
+    # Lower blocks (16x16 scale) - structure
+    - pattern: "up_blocks.0"
+      rank: 8
+    - pattern: "up_blocks.1"
+      rank: 8
+    - pattern: "up_blocks.2"
+      rank: 8
+    - pattern: "up_blocks.3"
+      rank: 8
+    
+    # Middle block (8x8 scale) - semantic content
+    - pattern: "mid_block"
+      rank: 12
+      alpha: 24
+    
+    # Down blocks (64x64, 32x32, 16x16 scale)
+    - pattern: "down_blocks.0"
+      rank: 8
+    - pattern: "down_blocks.1"
+      rank: 8
+    - pattern: "down_blocks.2"
+      rank: 12
+
+# Specialized projections for physics-informed learning
+specialized_modules:
+  material_recognition:
+    # to_k projections learn material properties
+    enable: true
+    module_path: "*.self_attn.to_k"
+    rank: 16
+    description: "Learn material emissivity and reflectance from RGB"
+  
+  emissivity_calculation:
+    # to_v projections learn temperature representation
+    enable: true
+    module_path: "*.self_attn.to_v"
+    rank: 16
+    description: "Learn thermal emissivity mapping"
+  
+  transmitivity_calculation:
+    # Cross-attention learns atmospheric effects
+    enable: true
+    module_path: "*.cross_attn.to_v"
+    rank: 12
+    description: "Learn atmospheric transmitivity"
+  
+  structure_preservation:
+    # Self-attention preserves structure
+    enable: true
+    module_path: "*.self_attn.to_q"
+    rank: 8
+    description: "Preserve structural information from depth/edges"
+
+# LoHA training hyperparameters
+training:
+  learning_rate: 5e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  lr_scheduler: "cosine"
+  
+  # LoHA specific training
+  lora_alpha: 32
+  rank_dropout: 0.1
+  module_dropout: 0.0
+  
+  # Loss weights
+  loss_weights:
+    l1: 1.0
+    hadar: 0.5              # Thermal dynamics
+    emissivity: 0.1         # Material properties
+    transmitivity: 0.05     # Atmospheric effects
+    perceptual: 0.1         # Feature similarity
+    structure: 0.2          # Attention consistency
+
+# Inference configuration
+inference:
+  guidance_scale: 7.5       # Classifier-free guidance strength
+  num_inference_steps: 50
+  
+  # ControlNet guidance
+  controlnet:
+    depth:
+      scale: 1.0            # Depth map influence
+    canny:
+      scale: 0.7            # Edge guidance influence
+  
+  # Feature extraction for losses
+  extract_features: true
+  extract_attention: true
+
+# Model loading
+model_loading:
+  pretrained_model: "stabilityai/stable-diffusion-xl-1-0"
+  load_weights_from: null   # Optional checkpoint to resume from
+  frozen_modules:           # Modules to keep frozen
+    - "text_encoder.layer.*.self_attn.to_q"
+    - "vae"                 # Keep VAE encoder frozen

@@ -119,12 +119,14 @@ class RGB2IRLoHaModel(nn.Module):
     def __init__(self, 
                  config_path: str,
                  device: str = 'cuda',
-                 enable_controlnet: bool = True):
+                 enable_controlnet: bool = True,
+                 pretrained_model_name_or_path: str = None):
         """
         Args:
             config_path: Path to LoHA configuration YAML
             device: Device to use ('cuda' or 'cpu')
             enable_controlnet: Whether to use ControlNet
+            pretrained_model_name_or_path: Override pretrained model path (from train config)
         """
         super().__init__()
         
@@ -135,13 +137,22 @@ class RGB2IRLoHaModel(nn.Module):
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
         
-        # Load base SDXL model
-        print("Loading SDXL base model...")
-        self.pipeline = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-            self.config['model_loading']['pretrained_model'],
+        # Use override if provided, otherwise use config
+        model_name = pretrained_model_name_or_path or self.config['model_loading']['pretrained_model']
+        
+        # Load base model (SD 1.5 or SDXL)
+        print(f"Loading base model: {model_name}...")
+        if "xl" in model_name.lower():
+            from diffusers import StableDiffusionXLImg2ImgPipeline as PipelineClass
+        else:
+            from diffusers import StableDiffusionImg2ImgPipeline as PipelineClass
+        
+        self.pipeline = PipelineClass.from_pretrained(
+            model_name,
             torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True
+            use_safetensors=True,
+            safety_checker=None,  # Disable safety checker (not needed for training)
+            requires_safety_checker=False
         )
         self.pipeline = self.pipeline.to(device)
         
@@ -229,6 +240,119 @@ class RGB2IRLoHaModel(nn.Module):
         """Disable attention slicing for speed"""
         self.pipeline.disable_attention_slicing()
     
+    def forward_train(self,
+                      rgb_image: torch.Tensor,
+                      ir_target: torch.Tensor,
+                      prompt: str = "a thermal infrared image",
+                      depth_map: Optional[torch.Tensor] = None,
+                      canny_edges: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Training forward pass - predicts noise at random timestep
+        
+        Args:
+            rgb_image: Input RGB image (B, 3, H, W) in [-1, 1]
+            ir_target: Target IR image (B, 1, H, W) in [-1, 1]
+            prompt: Text prompt for generation
+            depth_map: Depth map for ControlNet (B, 1, H, W) in [-1, 1]
+            canny_edges: Canny edges for ControlNet (B, 1, H, W) in [-1, 1]
+        
+        Returns:
+            Dictionary with:
+                'ir_pred': Predicted IR image (B, 1, H, W) - for visualization/logging only
+                'noise_pred': Predicted noise
+                'noise_target': Target noise (ground truth)
+        """
+        batch_size = rgb_image.shape[0]
+        
+        # Encode IR target to latent space (this is what we want to learn to generate)
+        # Expand IR to 3 channels for VAE
+        ir_input = (ir_target + 1.0) / 2.0  # Denormalize to [0, 1]
+        if ir_input.shape[1] == 1:
+            ir_input = ir_input.repeat(1, 3, 1, 1)
+        
+        # VAE is frozen, encode target latents (no gradients needed here)
+        with torch.no_grad():
+            target_latents = self.pipeline.vae.encode(ir_input).latent_dist.sample()
+            target_latents = target_latents * self.pipeline.vae.config.scaling_factor
+        
+        # Sample random timestep for each image
+        timesteps = torch.randint(
+            0, 
+            self.pipeline.scheduler.config.num_train_timesteps,
+            (batch_size,),
+            device=self.device
+        ).long()
+        
+        # Add noise to target latents
+        noise = torch.randn_like(target_latents)
+        noisy_latents = self.pipeline.scheduler.add_noise(target_latents, noise, timesteps)
+        
+        # Encode text prompt (frozen text encoder)
+        with torch.no_grad():
+            text_inputs = self.pipeline.tokenizer(
+                [prompt] * batch_size,
+                padding="max_length",
+                max_length=self.pipeline.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_input_ids = text_inputs.input_ids.to(self.device)
+            text_embeddings = self.pipeline.text_encoder(text_input_ids)[0]
+        
+        # Prepare ControlNet conditioning if enabled
+        down_block_additional_residuals = None
+        mid_block_additional_residual = None
+        
+        if self.enable_controlnet and depth_map is not None:
+            depth_input = (depth_map + 1.0) / 2.0  # Denormalize to [0, 1]
+            depth_input = depth_input.repeat(1, 3, 1, 1)  # Repeat to 3 channels
+            
+            with torch.no_grad():  # ControlNet is frozen
+                down_block_res_samples, mid_block_res_sample = self.controlnet_depth(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_input,
+                    return_dict=False
+                )
+                
+                depth_scale = self.config['inference']['controlnet']['depth']['scale']
+                down_block_additional_residuals = [sample * depth_scale for sample in down_block_res_samples]
+                mid_block_additional_residual = mid_block_res_sample * depth_scale
+        
+        # Predict noise using UNet - THIS is where LoRA adapters get trained!
+        # UNet has trainable LoRA parameters, so gradients flow here
+        noise_pred = self.pipeline.unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=text_embeddings,
+            down_block_additional_residuals=down_block_additional_residuals,
+            mid_block_additional_residual=mid_block_additional_residual,
+            return_dict=False
+        )[0]
+        
+        # For visualization/logging: predict clean latent and decode
+        # This part is optional and only used for monitoring (keep in no_grad)
+        with torch.no_grad():
+            alpha_prod_t = self.pipeline.scheduler.alphas_cumprod[timesteps].to(self.device, dtype=torch.float16)
+            alpha_prod_t = alpha_prod_t.flatten()
+            while len(alpha_prod_t.shape) < len(noisy_latents.shape):
+                alpha_prod_t = alpha_prod_t.unsqueeze(-1)
+            
+            pred_latents = (noisy_latents - torch.sqrt(1 - alpha_prod_t) * noise_pred) / torch.sqrt(alpha_prod_t)
+            ir_pred = self.pipeline.vae.decode(pred_latents / self.pipeline.vae.config.scaling_factor).sample
+            ir_pred = torch.clamp(ir_pred, -1.0, 1.0)
+            
+            # Convert to single channel
+            if ir_pred.shape[1] == 3:
+                ir_pred = ir_pred.mean(dim=1, keepdim=True)
+        
+        return {
+            'ir_pred': ir_pred,  # For visualization only (no gradients)
+            'noise_pred': noise_pred,  # For loss computation (HAS gradients from UNet)
+            'noise_target': noise  # Ground truth noise
+        }
+    
     def forward(self,
                 rgb_image: torch.Tensor,
                 prompt: str = "a thermal infrared image",
@@ -258,62 +382,94 @@ class RGB2IRLoHaModel(nn.Module):
                 'ir_image': Generated IR image (B, 1, H, W)
                 'features': Intermediate features (if return_features=True)
         """
+        batch_size = rgb_image.shape[0]
+        
         # Denormalize RGB to [0, 1] for VAE
         rgb_input = (rgb_image + 1.0) / 2.0
         
-        # Prepare ControlNet inputs if provided
-        control_image = None
-        controlnet_conditioning_scale = None
-        
-        if self.enable_controlnet and (depth_map is not None or canny_edges is not None):
-            # Combine control signals
-            if depth_map is not None and canny_edges is not None:
-                # Denormalize to [0, 1]
-                depth_normalized = (depth_map + 1.0) / 2.0
-                canny_normalized = (canny_edges + 1.0) / 2.0
-                
-                # Stack as multi-channel condition (3 channels for compatibility)
-                control_image = torch.cat([
-                    depth_normalized,
-                    canny_normalized,
-                    canny_normalized  # Repeat canny for 3 channels
-                ], dim=1)
-                
-                controlnet_conditioning_scale = [
-                    self.config['inference']['controlnet']['depth']['scale'],
-                    self.config['inference']['controlnet']['canny']['scale'],
-                    self.config['inference']['controlnet']['canny']['scale']
-                ]
-        
-        # Generate IR image
+        # Encode RGB image to latent space
         with torch.no_grad():
-            ir_output = self.pipeline(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=rgb_input,
-                control_image=control_image,
-                controlnet_conditioning_scale=controlnet_conditioning_scale,
-                strength=strength,
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_inference_steps,
-                output_type="latent" if return_features else "pil"
+            latents = self.pipeline.vae.encode(rgb_input).latent_dist.sample()
+            latents = latents * self.pipeline.vae.config.scaling_factor
+        
+        # Encode text prompts directly using text encoder
+        with torch.no_grad():
+            text_inputs = self.pipeline.tokenizer(
+                [prompt] * batch_size,
+                padding="max_length",
+                max_length=self.pipeline.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
             )
+            text_input_ids = text_inputs.input_ids.to(self.device)
+            text_embeddings = self.pipeline.text_encoder(text_input_ids)[0]
+        
+        # Add noise to latents for diffusion training
+        timestep = torch.randint(0, self.pipeline.scheduler.config.num_train_timesteps, (batch_size,), device=self.device)
+        noise = torch.randn_like(latents)
+        noisy_latents = self.pipeline.scheduler.add_noise(latents, noise, timestep)
+        
+        # Prepare ControlNet conditioning if available
+        down_block_additional_residuals = None
+        mid_block_additional_residual = None
+        
+        if self.enable_controlnet and depth_map is not None:
+            # Use depth for ControlNet conditioning
+            depth_input = (depth_map + 1.0) / 2.0  # Denormalize to [0, 1]
+            # Repeat to 3 channels for ControlNet
+            depth_input = depth_input.repeat(1, 3, 1, 1)
             
-            if return_features:
-                ir_latent = ir_output.images
-                # Decode latent to image
-                ir_image = self.pipeline.vae.decode(ir_latent).sample
-            else:
-                ir_image = ir_output.images
+            with torch.no_grad():
+                down_block_res_samples, mid_block_res_sample = self.controlnet_depth(
+                    noisy_latents,  # ControlNet works in latent space
+                    timestep,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_input,  # Conditioning in pixel space
+                    return_dict=False
+                )
+                
+                # Scale the ControlNet outputs
+                depth_scale = self.config['inference']['controlnet']['depth']['scale']
+                down_block_additional_residuals = [sample * depth_scale for sample in down_block_res_samples]
+                mid_block_additional_residual = mid_block_res_sample * depth_scale
+        
+        # Predict noise
+        noise_pred = self.pipeline.unet(
+            noisy_latents,
+            timestep,
+            encoder_hidden_states=text_embeddings,
+            down_block_additional_residuals=down_block_additional_residuals,
+            mid_block_additional_residual=mid_block_additional_residual,
+            return_dict=False
+        )[0]
+        
+        # For training, we predict the clean latent from the noise prediction
+        # Using the simple prediction: x0 = (xt - sqrt(1-alpha_t) * noise) / sqrt(alpha_t)
+        alpha_prod_t = self.pipeline.scheduler.alphas_cumprod[timestep].to(self.device, dtype=torch.float16)
+        alpha_prod_t = alpha_prod_t.flatten()
+        while len(alpha_prod_t.shape) < len(noisy_latents.shape):
+            alpha_prod_t = alpha_prod_t.unsqueeze(-1)
+        
+        # Predict original latent (keep in float16)
+        pred_latents = (noisy_latents - torch.sqrt(1 - alpha_prod_t) * noise_pred) / torch.sqrt(alpha_prod_t)
+        
+        # Decode to image space (VAE is frozen, but we need gradients to flow back through the prediction)
+        ir_image = self.pipeline.vae.decode(pred_latents / self.pipeline.vae.config.scaling_factor).sample
         
         # Normalize IR output to [-1, 1]
-        ir_image = ir_image * 2.0 - 1.0
+        ir_image = torch.clamp(ir_image, -1.0, 1.0)
+        
+        # Convert RGB output to single channel IR by averaging
+        if ir_image.shape[1] == 3:
+            ir_image = ir_image.mean(dim=1, keepdim=True)
         
         result = {'ir_image': ir_image}
         
         if return_features:
             result['features'] = {
-                'latent': ir_latent
+                'latent': pred_latents,
+                'noise_pred': noise_pred,
+                'noise_target': noise
             }
         
         return result
@@ -325,21 +481,23 @@ class RGB2IRLoHaModel(nn.Module):
         # Get LoHA parameters from text encoder
         if hasattr(self.pipeline.text_encoder, 'peft_config'):
             for name, param in self.pipeline.text_encoder.named_parameters():
-                if 'lora' in name.lower():
+                if 'lora' in name.lower() and param.requires_grad:
                     trainable_params.append((f"text_encoder.{name}", param))
         
         # Get LoHA parameters from UNet
         if hasattr(self.pipeline.unet, 'peft_config'):
             for name, param in self.pipeline.unet.named_parameters():
-                if 'lora' in name.lower():
+                if 'lora' in name.lower() and param.requires_grad:
                     trainable_params.append((f"unet.{name}", param))
         
         # Get specialized module parameters
         for name, param in self.material_recognition.named_parameters():
-            trainable_params.append((f"material_recognition.{name}", param))
+            if param.requires_grad:
+                trainable_params.append((f"material_recognition.{name}", param))
         
         for name, param in self.emissivity_calculation.named_parameters():
-            trainable_params.append((f"emissivity_calculation.{name}", param))
+            if param.requires_grad:
+                trainable_params.append((f"emissivity_calculation.{name}", param))
         
         return trainable_params
     

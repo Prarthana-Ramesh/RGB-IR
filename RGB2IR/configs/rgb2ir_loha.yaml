@@ -146,7 +146,7 @@ inference:
 
 # Model loading
 model_loading:
-  pretrained_model: "stabilityai/stable-diffusion-xl-1-0"
+  pretrained_model: "runwayml/stable-diffusion-v1-5"  # Using SD 1.5 (smaller, faster)
   load_weights_from: null   # Optional checkpoint to resume from
   frozen_modules:           # Modules to keep frozen
     - "text_encoder.layer.*.self_attn.to_q"

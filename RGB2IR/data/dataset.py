@@ -88,11 +88,11 @@ class RGBIRPairedDataset(Dataset):
     
     def _get_augmentation(self):
         """Define albumentations pipeline"""
+        # Note: Images are already resized in _load_image, so no need for Resize here
+        # Note: GaussNoise removed because it doesn't work well with mixed channel images
         return A.Compose([
-            A.Resize(height=self.image_size[0], width=self.image_size[1]),
             A.HorizontalFlip(p=0.5),
             A.RandomBrightnessContrast(p=0.2),
-            A.GaussNoise(p=0.1),
             A.ToFloat(max_value=255.0),
         ], additional_targets={
             'ir': 'image',
@@ -119,6 +119,9 @@ class RGBIRPairedDataset(Dataset):
             if len(img.shape) == 2:
                 img = np.expand_dims(img, axis=-1)
         
+        # Resize to target size to ensure consistent shapes before augmentation
+        img = cv2.resize(img, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_LINEAR)
+        
         return img
     
     def _load_depth(self, img_name: str) -> Optional[np.ndarray]:
@@ -132,6 +135,10 @@ class RGBIRPairedDataset(Dataset):
         
         if depth_npy.exists():
             depth = np.load(depth_npy).astype(np.float32)
+            if len(depth.shape) == 2:
+                depth = np.expand_dims(depth, axis=-1)
+            # Resize to target size for consistency
+            depth = cv2.resize(depth, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_LINEAR)
             if len(depth.shape) == 2:
                 depth = np.expand_dims(depth, axis=-1)
         elif depth_png.exists():

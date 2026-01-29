@@ -34,13 +34,19 @@ class RGB2IRInference:
         self.model = RGB2IRLoHaModel(
             config_path=config_path,
             device=device,
-            enable_controlnet=True
+            enable_controlnet=False  # Disabled to match training configuration
         )
         
         # Load checkpoint if provided
         if checkpoint_path:
             logger.info(f"Loading checkpoint from {checkpoint_path}")
-            self.model.load_lora_weights(checkpoint_path)
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            if 'model_state_dict' in checkpoint:
+                # Loading from training checkpoint
+                self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                # Loading from raw state dict
+                self.model.load_state_dict(checkpoint, strict=False)
         
         # Set to eval mode
         self.model.pipeline.unet.eval()
@@ -106,8 +112,14 @@ class RGB2IRInference:
                     canny_edges = torch.from_numpy(np.expand_dims(edges, 0)).float().to(self.device)
                     canny_edges = canny_edges * 2.0 - 1.0
             
-            # Prepare RGB for model
-            rgb_model = rgb_image.unsqueeze(0).to(self.device) if rgb_image.dim() == 3 else rgb_image.to(self.device)
+            # Prepare RGB for model (convert to float16 for the pipeline)
+            rgb_model = rgb_image.unsqueeze(0).to(self.device, dtype=torch.float16) if rgb_image.dim() == 3 else rgb_image.to(self.device, dtype=torch.float16)
+            
+            # Convert control inputs to float16 as well
+            if depth_map is not None:
+                depth_map = depth_map.unsqueeze(0).to(dtype=torch.float16) if depth_map.dim() == 2 else depth_map.to(dtype=torch.float16)
+            if canny_edges is not None:
+                canny_edges = canny_edges.unsqueeze(0).to(dtype=torch.float16) if canny_edges.dim() == 2 else canny_edges.to(dtype=torch.float16)
             
             # Generate IR
             output = self.model(

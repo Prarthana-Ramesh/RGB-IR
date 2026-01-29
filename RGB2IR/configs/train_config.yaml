@@ -5,12 +5,12 @@ training:
   output_dir: "./experiments/rgb2ir_v1"
   
   # Training hyperparameters
-  batch_size: 4
+  batch_size: 6
   num_workers: 4
   epochs: 100
   
   # Learning rate schedule
-  learning_rate: 5e-4
+  learning_rate: 1e-4
   weight_decay: 0.01
   warmup_steps: 500
   lr_scheduler: "cosine"  # Options: cosine, constant, step
@@ -18,7 +18,7 @@ training:
   # Training settings
   log_interval: 100        # Log metrics every N steps
   save_interval: 5         # Save checkpoint every N epochs
-  val_interval: 2          # Validate every N epochs
+  val_interval: 1          # Validate every N epochs
   
   # Loss weights
   loss_weights:
@@ -36,17 +36,17 @@ training:
 
 # Model configuration
 model:
-  config_path: "./configs/rgb2ir_loha.yaml"
-  enable_controlnet: true
+  config_path: "/home/atr_ir/Desktop/nbrgbir/RGB-IR/RGB2IR/configs/rgb2ir_loha.yaml"
+  enable_controlnet: true  # Re-enabled now that basic training works
   
-  # Pretrained model
-  pretrained: "stabilityai/stable-diffusion-xl-1-0"
+  # Pretrained model - using local cached SD 1.5 (no download needed)
+  pretrained: "/home/atr_ir/.cache/huggingface/hub/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
   load_weights: null  # Optional checkpoint to resume training
 
 
 # Data configuration
 data:
-  dataset_root: "./data/RGB2IR_dataset"  # Path to your aligned RGB-IR dataset
+  dataset_root: "/home/atr_ir/Desktop/nbrgbir/RGB-IR/RGB2IR/data/RGB2IR_dataset"  # Path to your aligned RGB-IR dataset
   image_size: [512, 512]  # Input image size
   
   # Data augmentation

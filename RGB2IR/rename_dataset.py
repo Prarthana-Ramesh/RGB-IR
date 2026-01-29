@@ -190,7 +190,172 @@ class DatasetRenamer:
             logger.info(f"  Errors: {len(errors)}")
             for error in errors[:5]:
                 logger.info(f"    - {error}")
-    Split and rename RGB-IR dataset to sequential format',
+    
+    def rename_to_sequential(self, split: str, prefix: str = 'scene', 
+                            start_index: int = 1, padding: int = 3,
+                            extension: str = '.png', dry_run: bool = False):
+        """
+        Rename RGB-IR image pairs to sequential format (e.g., scene_001.png, scene_002.png)
+        
+        Args:
+            split: 'train', 'val', or 'test'
+            prefix: Prefix for renamed files (default: 'scene')
+            start_index: Starting index (default: 1)
+            padding: Number of digits for zero-padding (default: 3)
+            extension: File extension to use (default: '.png')
+            dry_run: If True, only show what would be renamed without actually renaming
+        """
+        logger.info(f"{'[DRY RUN] ' if dry_run else ''}Renaming images in {split} to sequential format...")
+        
+        split_dir = self.dataset_root / split
+        rgb_dir = split_dir / 'rgb'
+        ir_dir = split_dir / 'ir'
+        depth_dir = split_dir / 'depth'
+        mask_dir = split_dir / 'masks'
+        
+        if not rgb_dir.exists():
+            logger.error(f"RGB directory not found: {rgb_dir}")
+            return
+        
+        # Get all RGB images and sort them for consistent ordering
+        rgb_images = sorted(list(rgb_dir.glob('*.png')) + 
+                           list(rgb_dir.glob('*.jpg')) + 
+                           list(rgb_dir.glob('*.jpeg')))
+        
+        if len(rgb_images) == 0:
+            logger.warning(f"No RGB images found in {rgb_dir}")
+            return
+        
+        logger.info(f"Found {len(rgb_images)} RGB images")
+        
+        # Create mapping of old names to new names
+        rename_mapping = []
+        for idx, rgb_path in enumerate(rgb_images, start=start_index):
+            new_name = f"{prefix}_{idx:0{padding}d}{extension}"
+            rename_mapping.append({
+                'old_name': rgb_path.name,
+                'new_name': new_name,
+                'index': idx
+            })
+        
+        # Show preview
+        logger.info("\nRename preview (first 10):")
+        for item in rename_mapping[:10]:
+            logger.info(f"  {item['old_name']} → {item['new_name']}")
+        if len(rename_mapping) > 10:
+            logger.info(f"  ... and {len(rename_mapping) - 10} more")
+        
+        if dry_run:
+            logger.info("\n[DRY RUN] No files were renamed. Remove --dry_run to apply changes.")
+            return
+        
+        # Confirm before proceeding
+        logger.info(f"\nAbout to rename {len(rename_mapping)} image pairs")
+        
+        # Perform renaming
+        renamed_count = 0
+        errors = []
+        
+        for mapping in tqdm(rename_mapping, desc="Renaming files"):
+            old_name = mapping['old_name']
+            new_name = mapping['new_name']
+            
+            try:
+                # Get old paths
+                old_rgb_path = rgb_dir / old_name
+                old_ir_path = ir_dir / old_name
+                
+                # Get new paths
+                new_rgb_path = rgb_dir / new_name
+                new_ir_path = ir_dir / new_name
+                
+                # Check if IR exists
+                if not old_ir_path.exists():
+                    logger.warning(f"IR image not found for {old_name}, skipping")
+                    errors.append(f"Missing IR: {old_name}")
+                    continue
+                
+                # Rename RGB
+                old_rgb_path.rename(new_rgb_path)
+                
+                # Rename IR
+                old_ir_path.rename(new_ir_path)
+                
+                # Rename depth if exists
+                if depth_dir.exists():
+                    old_stem = Path(old_name).stem
+                    old_depth_npy = depth_dir / f"{old_stem}.npy"
+                    old_depth_png = depth_dir / f"{old_stem}.png"
+                    new_stem = Path(new_name).stem
+                    
+                    if old_depth_npy.exists():
+                        new_depth_path = depth_dir / f"{new_stem}.npy"
+                        old_depth_npy.rename(new_depth_path)
+                    elif old_depth_png.exists():
+                        new_depth_path = depth_dir / f"{new_stem}.png"
+                        old_depth_png.rename(new_depth_path)
+                
+                # Rename mask if exists
+                if mask_dir.exists():
+                    old_mask_path = mask_dir / old_name
+                    if old_mask_path.exists():
+                        new_mask_path = mask_dir / new_name
+                        old_mask_path.rename(new_mask_path)
+                
+                renamed_count += 1
+                
+            except Exception as e:
+                error_msg = f"Error renaming {old_name}: {str(e)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+        
+        # Summary
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Renaming complete!")
+        logger.info(f"Successfully renamed: {renamed_count} image pairs")
+        logger.info(f"Errors: {len(errors)}")
+        if errors:
+            logger.info("\nErrors encountered:")
+            for error in errors[:10]:
+                logger.info(f"  - {error}")
+            if len(errors) > 10:
+                logger.info(f"  ... and {len(errors) - 10} more errors")
+        logger.info(f"{'='*60}\n")
+    
+    def rename_all_splits(self, prefix: str = 'scene', 
+                         start_index: int = 1, padding: int = 3,
+                         extension: str = '.png', dry_run: bool = False):
+        """
+        Rename all splits (train, val, test) to sequential format
+        
+        Args:
+            prefix: Prefix for renamed files (default: 'scene')
+            start_index: Starting index (default: 1)
+            padding: Number of digits for zero-padding (default: 3)
+            extension: File extension to use (default: '.png')
+            dry_run: If True, only show what would be renamed without actually renaming
+        """
+        for split in self.splits:
+            split_dir = self.dataset_root / split
+            if split_dir.exists():
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Processing {split} split")
+                logger.info(f"{'='*60}")
+                self.rename_to_sequential(
+                    split=split,
+                    prefix=prefix,
+                    start_index=start_index,
+                    padding=padding,
+                    extension=extension,
+                    dry_run=dry_run
+                )
+            else:
+                logger.warning(f"Split directory not found: {split_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Split and rename RGB-IR dataset to sequential format',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -306,172 +471,7 @@ Examples:
                 padding=args.padding,
                 extension=args.extension,
                 dry_run=args.dry_run
-            # Confirm before proceeding
-        logger.info(f"\nAbout to rename {len(rename_mapping)} image pairs")
-        
-        # Perform renaming
-        renamed_count = 0
-        errors = []
-        
-        for mapping in tqdm(rename_mapping, desc="Renaming files"):
-            old_name = mapping['old_name']
-            new_name = mapping['new_name']
-            
-            try:
-                # Get old paths
-                old_rgb_path = rgb_dir / old_name
-                old_ir_path = ir_dir / old_name
-                
-                # Get new paths
-                new_rgb_path = rgb_dir / new_name
-                new_ir_path = ir_dir / new_name
-                
-                # Check if IR exists
-                if not old_ir_path.exists():
-                    logger.warning(f"IR image not found for {old_name}, skipping")
-                    errors.append(f"Missing IR: {old_name}")
-                    continue
-                
-                # Rename RGB
-                old_rgb_path.rename(new_rgb_path)
-                
-                # Rename IR
-                old_ir_path.rename(new_ir_path)
-                
-                # Rename depth if exists
-                if depth_dir.exists():
-                    old_stem = Path(old_name).stem
-                    old_depth_npy = depth_dir / f"{old_stem}.npy"
-                    old_depth_png = depth_dir / f"{old_stem}.png"
-                    new_stem = Path(new_name).stem
-                    
-                    if old_depth_npy.exists():
-                        new_depth_path = depth_dir / f"{new_stem}.npy"
-                        old_depth_npy.rename(new_depth_path)
-                    elif old_depth_png.exists():
-                        new_depth_path = depth_dir / f"{new_stem}.png"
-                        old_depth_png.rename(new_depth_path)
-                
-                # Rename mask if exists
-                if mask_dir.exists():
-                    old_mask_path = mask_dir / old_name
-                    if old_mask_path.exists():
-                        new_mask_path = mask_dir / new_name
-                        old_mask_path.rename(new_mask_path)
-                
-                renamed_count += 1
-                
-            except Exception as e:
-                error_msg = f"Error renaming {old_name}: {str(e)}"
-                logger.error(error_msg)
-                errors.append(error_msg)
-        
-        # Summary
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Renaming complete!")
-        logger.info(f"Successfully renamed: {renamed_count} image pairs")
-        logger.info(f"Errors: {len(errors)}")
-        if errors:
-            logger.info("\nErrors encountered:")
-            for error in errors[:10]:
-                logger.info(f"  - {error}")
-            if len(errors) > 10:
-                logger.info(f"  ... and {len(errors) - 10} more errors")
-        logger.info(f"{'='*60}\n")
-    
-    def rename_all_splits(self, prefix: str = 'scene', 
-                         start_index: int = 1, padding: int = 3,
-                         extension: str = '.png', dry_run: bool = False):
-        """
-        Rename all splits (train, val, test) to sequential format
-        
-        Args:
-            prefix: Prefix for renamed files (default: 'scene')
-            start_index: Starting index (default: 1)
-            padding: Number of digits for zero-padding (default: 3)
-            extension: File extension to use (default: '.png')
-            dry_run: If True, only show what would be renamed without actually renaming
-        """
-        for split in self.splits:
-            split_dir = self.dataset_root / split
-            if split_dir.exists():
-                logger.info(f"\n{'='*60}")
-                logger.info(f"Processing {split} split")
-                logger.info(f"{'='*60}")
-                self.rename_to_sequential(
-                    split=split,
-                    prefix=prefix,
-                    start_index=start_index,
-                    padding=padding,
-                    extension=extension,
-                    dry_run=dry_run
-                )
-            else:
-                logger.warning(f"Split directory not found: {split_dir}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Rename RGB-IR dataset to sequential format (scene_001.png, etc.)',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Preview changes (dry run)
-  python rename_dataset.py --dataset_root data/RGB2IR_dataset --split train --dry_run
-  
-  # Rename train split
-  python rename_dataset.py --dataset_root data/RGB2IR_dataset --split train
-  
-  # Rename all splits
-  python rename_dataset.py --dataset_root data/RGB2IR_dataset --all
-  
-  # Custom prefix and padding
-  python rename_dataset.py --dataset_root data/RGB2IR_dataset --split train \\
-    --prefix image --padding 5 --start_index 100
-        """
-    )
-    
-    parser.add_argument('--dataset_root', type=str, required=True, 
-                       help='Path to dataset root directory')
-    parser.add_argument('--split', type=str, default='train', 
-                       choices=['train', 'val', 'test'],
-                       help='Split to process (default: train)')
-    parser.add_argument('--all', action='store_true', 
-                       help='Process all splits (train, val, test)')
-    parser.add_argument('--prefix', type=str, default='scene', 
-                       help='Prefix for renamed files (default: scene)')
-    parser.add_argument('--start_index', type=int, default=1, 
-                       help='Starting index for renaming (default: 1)')
-    parser.add_argument('--padding', type=int, default=3, 
-                       help='Number of digits for zero-padding (default: 3)')
-    parser.add_argument('--extension', type=str, default='.png',
-                       help='File extension to use (default: .png)')
-    parser.add_argument('--dry_run', action='store_true', 
-                       help='Show what would be renamed without actually renaming')
-    
-    args = parser.parse_args()
-    
-    # Create renamer
-    renamer = DatasetRenamer(args.dataset_root)
-    
-    # Rename files
-    if args.all:
-        renamer.rename_all_splits(
-            prefix=args.prefix,
-            start_index=args.start_index,
-            padding=args.padding,
-            extension=args.extension,
-            dry_run=args.dry_run
-        )
-    else:
-        renamer.rename_to_sequential(
-            split=args.split,
-            prefix=args.prefix,
-            start_index=args.start_index,
-            padding=args.padding,
-            extension=args.extension,
-            dry_run=args.dry_run
-        )
+            )
 
 
 if __name__ == '__main__':

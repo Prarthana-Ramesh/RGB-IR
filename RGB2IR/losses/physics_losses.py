@@ -2,18 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, List, Tuple
-from abc import ABC, abstractmethod
 
 
-class ThermalPhysicsLoss(ABC):
-    """Base class for physics-informed thermal losses"""
-    
-    @abstractmethod
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pass
-
-
-class HADARLoss(ThermalPhysicsLoss):
+class HADARLoss(nn.Module):
     """
     Heat-Aided Deep learning Attentive Reasoning (HADAR) Loss
     Incorporates thermal dynamics and physical constraints
@@ -25,6 +16,7 @@ class HADARLoss(ThermalPhysicsLoss):
             lambda_hadar: Weight for HADAR loss component
             weight_thermal: Weight for thermal consistency
         """
+        super().__init__()
         self.lambda_hadar = lambda_hadar
         self.weight_thermal = weight_thermal
         self.mse_loss = nn.MSELoss()
@@ -32,9 +24,9 @@ class HADARLoss(ThermalPhysicsLoss):
     def compute_thermal_gradient(self, ir_image: torch.Tensor) -> torch.Tensor:
         """Compute spatial temperature gradients (Sobel filter)"""
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                               dtype=torch.float32, device=ir_image.device).view(1, 1, 3, 3)
+                               dtype=ir_image.dtype, device=ir_image.device).view(1, 1, 3, 3)
         sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                               dtype=torch.float32, device=ir_image.device).view(1, 1, 3, 3)
+                               dtype=ir_image.dtype, device=ir_image.device).view(1, 1, 3, 3)
         
         # Compute gradients
         grad_x = F.conv2d(ir_image, sobel_x, padding=1)
@@ -49,7 +41,7 @@ class HADARLoss(ThermalPhysicsLoss):
         """
         # Compute Laplacian (local temperature variance)
         laplacian = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], 
-                                 dtype=torch.float32, device=ir_image.device).view(1, 1, 3, 3)
+                                 dtype=ir_image.dtype, device=ir_image.device).view(1, 1, 3, 3)
         laplacian_map = F.conv2d(ir_image, laplacian, padding=1)
         
         # Penalize high-frequency noise
@@ -80,7 +72,7 @@ class HADARLoss(ThermalPhysicsLoss):
         return total_loss
 
 
-class EmissivityLoss(ThermalPhysicsLoss):
+class EmissivityLoss(nn.Module):
     """
     Material emissivity loss
     Different materials have different thermal emissivity values
@@ -88,6 +80,7 @@ class EmissivityLoss(ThermalPhysicsLoss):
     """
     
     def __init__(self, lambda_emissivity: float = 0.1):
+        super().__init__()
         self.lambda_emissivity = lambda_emissivity
         
     def forward(self, pred: torch.Tensor, target: torch.Tensor, 
@@ -110,7 +103,7 @@ class EmissivityLoss(ThermalPhysicsLoss):
         return self.lambda_emissivity * emissivity_loss
 
 
-class TransmitivityLoss(ThermalPhysicsLoss):
+class TransmitivityLoss(nn.Module):
     """
     Atmospheric transmitivity loss
     Models how IR radiation is affected by atmospheric conditions
@@ -118,6 +111,7 @@ class TransmitivityLoss(ThermalPhysicsLoss):
     """
     
     def __init__(self, lambda_transmitivity: float = 0.05, window_size: int = 16):
+        super().__init__()
         self.lambda_transmitivity = lambda_transmitivity
         self.window_size = window_size
         
@@ -240,33 +234,27 @@ class CombinedPhysicsLoss(nn.Module):
         
         # L1 Reconstruction
         l1_loss = self.l1_loss(pred, target)
-        loss_dict['l1'] = l1_loss.item()
         
-        # HADAR Loss (thermal dynamics)
+        # HADAR Loss (thermal dynamics) - already includes lambda_hadar internally
         hadar_loss = self.hadar_loss(pred, target)
-        loss_dict['hadar'] = hadar_loss.item()
         
-        # Emissivity Loss
+        # Emissivity Loss - already includes lambda_emissivity internally
         emissivity_loss = self.emissivity_loss(pred, target)
-        loss_dict['emissivity'] = emissivity_loss.item()
         
-        # Transmitivity Loss
+        # Transmitivity Loss - already includes lambda_transmitivity internally
         transmitivity_loss = self.transmitivity_loss(pred, target)
-        loss_dict['transmitivity'] = transmitivity_loss.item()
         
         # Perceptual Loss (if features provided)
-        perceptual_loss = torch.tensor(0.0, device=pred.device)
+        perceptual_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         if pred_features is not None and target_features is not None:
             perceptual_loss = self.perceptual_loss(pred_features, target_features)
-            loss_dict['perceptual'] = perceptual_loss.item()
         
         # Structure Loss (if attention maps provided)
-        structure_loss = torch.tensor(0.0, device=pred.device)
+        structure_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         if pred_attention is not None and target_attention is not None:
             structure_loss = self.structure_loss(pred_attention, target_attention)
-            loss_dict['structure'] = structure_loss.item()
         
-        # Combined loss
+        # Combined loss - keep as tensor for backprop!
         total_loss = (self.lambda_l1 * l1_loss + 
                       hadar_loss + 
                       emissivity_loss + 
@@ -274,6 +262,13 @@ class CombinedPhysicsLoss(nn.Module):
                       perceptual_loss +
                       structure_loss)
         
+        # Only convert to Python floats for logging - AFTER computing total_loss
+        loss_dict['l1'] = l1_loss.item()
+        loss_dict['hadar'] = hadar_loss.item()
+        loss_dict['emissivity'] = emissivity_loss.item()
+        loss_dict['transmitivity'] = transmitivity_loss.item()
+        loss_dict['perceptual'] = perceptual_loss.item()
+        loss_dict['structure'] = structure_loss.item()
         loss_dict['total'] = total_loss.item()
         
         return total_loss, loss_dict

@@ -3,7 +3,7 @@ torchvision>=0.15.0
 diffusers>=0.21.0
 transformers>=4.30.0
 peft>=0.4.0
-PIL
+pillow
 opencv-python>=4.8.0
 numpy
 scipy
